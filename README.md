@@ -3,6 +3,8 @@
 [![CI](https://github.com/Joshuabarradas234/jobadder-oauth-aws/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Joshuabarradas234/jobadder-oauth-aws/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
+**▶ [Live interactive demo](https://joshuabarradas234.github.io/jobadder-oauth-aws/docs/demo.html)** — watch the full pipeline run end-to-end in your browser (no setup, no backend).
+
 A serverless AWS integration that connects to the [JobAdder](https://developers.jobadder.com)
 recruitment API using the OAuth 2.0 authorization-code flow, with **automatic
 token refresh** so the access token never lapses. Built entirely with native

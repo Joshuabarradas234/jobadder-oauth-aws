@@ -1,5 +1,8 @@
 # JobAdder OAuth 2.0 Integration on AWS
 
+[![CI](https://github.com/Joshuabarradas234/jobadder-oauth-aws/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Joshuabarradas234/jobadder-oauth-aws/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+
 A serverless AWS integration that connects to the [JobAdder](https://developers.jobadder.com)
 recruitment API using the OAuth 2.0 authorization-code flow, with **automatic
 token refresh** so the access token never lapses. Built entirely with native
@@ -24,7 +27,10 @@ indefinitely without manual intervention.
 ## Architecture
 
 Open [`docs/architecture.html`](docs/architecture.html) in a browser for the
-full interactive diagram. In summary:
+full interactive diagram, or [`docs/demo.html`](docs/demo.html) for an **animated
+walkthrough** that visualises the whole pipeline running end-to-end (SQS → API
+Gateway → Secrets Manager/KMS → Lambda → JobAdder → refresh), with a live event
+log. In summary:
 
 ```
                     ┌──────────────────────────────────────────┐
@@ -111,6 +117,22 @@ this repo implements the single-tenant version it evolves from.
 - Event-driven, serverless architecture with proper failure handling (DLQ, alarms)
 - Secrets management and encryption done correctly (KMS, least privilege, no secrets in code)
 - Infrastructure as code (single CloudFormation template, repeatable deploy)
+- Tested decision logic (`node:test`) and CI on every push — ESLint, unit tests, and `cfn-lint` validation of the CloudFormation template
+
+## Tests & CI
+
+The token-refresh and API-status decision logic lives in [`lib/token-logic.js`](lib/token-logic.js)
+as pure functions the Lambdas import, so it can be unit-tested without AWS, the
+network, or the clock:
+
+```bash
+npm install
+npm test      # node:test unit tests
+npm run lint  # ESLint
+```
+
+GitHub Actions runs the lint + tests and validates `cloudformation.yaml` with
+`cfn-lint` on every push.
 
 ## Repo layout
 
@@ -119,11 +141,18 @@ lambda/
   oauth-callback/      # code → tokens, stored encrypted
   token-refresh/       # scheduled + on-401 refresh
   candidate-fetcher/   # calls JobAdder API, 401→refresh→retry
+lib/
+  token-logic.js       # pure, unit-tested decision logic (shared by the Lambdas)
+test/
+  token-logic.test.js  # node:test unit tests
 scripts/
   deploy.sh            # package + deploy + print redirect URI
   generate-auth-url.js # one-time OAuth kickoff
 cloudformation.yaml    # the whole stack as IaC
+.github/workflows/
+  ci.yml               # ESLint + unit tests + cfn-lint on every push
 docs/
   architecture.html         # interactive architecture diagram
+  demo.html                 # animated end-to-end pipeline walkthrough
   multi-tenant-design.html  # proposed multi-tenant evolution
 ```

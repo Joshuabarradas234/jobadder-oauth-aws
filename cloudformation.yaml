@@ -50,18 +50,23 @@ Resources:
               AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
             Action: kms:*
             Resource: "*"
-          - Sid: Allow Lambda roles to use key
+          # Grant key usage to principals in this account that are permitted via
+          # IAM (the Lambda roles' managed policy). Using a condition instead of
+          # naming the role ARNs here avoids a circular dependency between the
+          # key, the roles, and their policy.
+          - Sid: Allow use of the key by account IAM principals
             Effect: Allow
             Principal:
-              AWS:
-                - !GetAtt OAuthCallbackLambdaRole.Arn
-                - !GetAtt TokenRefreshLambdaRole.Arn
-                - !GetAtt CandidateFetcherLambdaRole.Arn
+              AWS: "*"
             Action:
               - kms:Decrypt
               - kms:GenerateDataKey
               - kms:DescribeKey
             Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+                kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
 
   JobAdderKMSKeyAlias:
     Type: AWS::KMS::Alias
@@ -73,7 +78,7 @@ Resources:
 # SECRETS MANAGER — credential store
 # ─────────────────────────────────────────────
 
-  JobAdderClientSecret:
+  JobAdderClientCredentials:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub jobadder-oauth/${Environment}/client-credentials
@@ -177,7 +182,7 @@ Resources:
               - secretsmanager:PutSecretValue
               - secretsmanager:DescribeSecret
             Resource:
-              - !Ref JobAdderClientSecret
+              - !Ref JobAdderClientCredentials
               - !Ref JobAdderTokenSecret
           - Effect: Allow
             Action:
@@ -262,7 +267,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub jobadder-oauth-oauth-callback-${Environment}
-      Runtime: nodejs20.x
+      Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt OAuthCallbackLambdaRole.Arn
       Timeout: 30
@@ -272,7 +277,7 @@ Resources:
       Environment:
         Variables:
           ENVIRONMENT: !Ref Environment
-          CLIENT_SECRET_ARN: !Ref JobAdderClientSecret
+          CLIENT_SECRET_ARN: !Ref JobAdderClientCredentials
           TOKEN_SECRET_ARN: !Ref JobAdderTokenSecret
           JOBADDER_TOKEN_URL: https://id.jobadder.com/connect/token
           REDIRECT_URI: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/oauth/callback
@@ -286,7 +291,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub jobadder-oauth-token-refresh-${Environment}
-      Runtime: nodejs20.x
+      Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt TokenRefreshLambdaRole.Arn
       Timeout: 30
@@ -296,7 +301,7 @@ Resources:
       Environment:
         Variables:
           ENVIRONMENT: !Ref Environment
-          CLIENT_SECRET_ARN: !Ref JobAdderClientSecret
+          CLIENT_SECRET_ARN: !Ref JobAdderClientCredentials
           TOKEN_SECRET_ARN: !Ref JobAdderTokenSecret
           JOBADDER_TOKEN_URL: https://id.jobadder.com/connect/token
       Code:
@@ -308,7 +313,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub jobadder-oauth-candidate-fetcher-${Environment}
-      Runtime: nodejs20.x
+      Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt CandidateFetcherLambdaRole.Arn
       Timeout: 300  # 5 min max

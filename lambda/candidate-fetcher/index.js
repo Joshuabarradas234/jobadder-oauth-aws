@@ -23,6 +23,7 @@ const {
 } = require('@aws-sdk/client-lambda');
 
 const https = require('https');
+const { classifyApiStatus } = require('../../lib/token-logic');
 
 const sm = new SecretsManagerClient({ region: process.env.AWS_REGION || 'eu-west-2' });
 const lambda = new LambdaClient({ region: process.env.AWS_REGION || 'eu-west-2' });
@@ -108,21 +109,20 @@ async function fetchCandidate(candidateId) {
     response = await apiGet(`/candidates/${candidateId}`, tokens.access_token);
   }
 
-  if (response.statusCode === 200) {
-    console.log(`Candidate ${candidateId} fetched successfully`);
-    return { success: true, candidateId, data: response.data };
+  switch (classifyApiStatus(response.statusCode)) {
+    case 'ok':
+      console.log(`Candidate ${candidateId} fetched successfully`);
+      return { success: true, candidateId, data: response.data };
+    case 'not_found':
+      console.warn(`Candidate ${candidateId} not found (404) — removing from queue`);
+      // Return success=true so SQS deletes the message (it's not retryable)
+      return { success: true, candidateId, notFound: true };
+    default:
+      // Any other error — throw to let SQS retry / route to DLQ
+      throw new Error(
+        `JobAdder API error ${response.statusCode} for candidate ${candidateId}: ${JSON.stringify(response.data)}`
+      );
   }
-
-  if (response.statusCode === 404) {
-    console.warn(`Candidate ${candidateId} not found (404) — removing from queue`);
-    // Return success=true so SQS deletes the message (it's not retryable)
-    return { success: true, candidateId, notFound: true };
-  }
-
-  // Any other error — throw to let SQS retry / route to DLQ
-  throw new Error(
-    `JobAdder API error ${response.statusCode} for candidate ${candidateId}: ${JSON.stringify(response.data)}`
-  );
 }
 
 // ─── handler ────────────────────────────────────────────────────────────────

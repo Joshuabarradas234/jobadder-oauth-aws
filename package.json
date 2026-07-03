@@ -1,0 +1,13 @@
+{
+  "name": "jobadder-oauth-aws",
+  "version": "1.0.0",
+  "description": "Serverless JobAdder OAuth 2.0 integration on AWS with automatic token refresh",
+  "scripts": {
+    "test": "node --test",
+    "lint": "eslint lib test lambda scripts"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0"
+  },
+  "license": "MIT"
+}

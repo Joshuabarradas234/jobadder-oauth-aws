@@ -18,6 +18,7 @@ const {
 
 const https = require('https');
 const querystring = require('querystring');
+const { computeExpiresAt } = require('../../lib/token-logic');
 
 const sm = new SecretsManagerClient({ region: process.env.AWS_REGION || 'eu-west-2' });
 
@@ -120,7 +121,7 @@ exports.handler = async (event) => {
     });
 
     // 3. Calculate absolute expiry timestamp
-    const expiresAt = Math.floor(Date.now() / 1000) + (tokenResponse.expires_in || 3600);
+    const expiresAt = computeExpiresAt(Math.floor(Date.now() / 1000), tokenResponse.expires_in);
 
     // 4. Store tokens in Secrets Manager (encrypted via KMS automatically)
     await sm.send(new PutSecretValueCommand({

@@ -17,6 +17,7 @@ const {
 } = require('@aws-sdk/client-secrets-manager');
 
 const https = require('https');
+const { shouldRefresh, computeExpiresAt } = require('../../lib/token-logic');
 const querystring = require('querystring');
 
 const sm = new SecretsManagerClient({ region: process.env.AWS_REGION || 'eu-west-2' });
@@ -87,10 +88,13 @@ exports.handler = async (event = {}) => {
   //    Unless triggered by a 401, in which case force-refresh.
   const forced = event.force === true || source === 'candidate-fetcher-401';
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const expiresAt = currentTokens.expires_at || 0;
-  const minutesRemaining = (expiresAt - nowSeconds) / 60;
+  const { refresh, minutesRemaining } = shouldRefresh({
+    expiresAt: currentTokens.expires_at || 0,
+    now: nowSeconds,
+    forced,
+  });
 
-  if (!forced && minutesRemaining > 15) {
+  if (!refresh) {
     console.log(`Token still valid for ~${Math.round(minutesRemaining)} minutes. Skipping refresh.`);
     return { refreshed: false, minutesRemaining: Math.round(minutesRemaining) };
   }
@@ -127,7 +131,7 @@ exports.handler = async (event = {}) => {
   });
 
   // 5. Store new tokens — refresh_token may rotate, always update both
-  const newExpiresAt = nowSeconds + (tokenResponse.expires_in || 3600);
+  const newExpiresAt = computeExpiresAt(nowSeconds, tokenResponse.expires_in);
 
   await sm.send(new PutSecretValueCommand({
     SecretId: process.env.TOKEN_SECRET_ARN,

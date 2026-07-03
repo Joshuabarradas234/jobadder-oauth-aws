@@ -1,0 +1,511 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  JobAdder OAuth on AWS — JobAdder OAuth 2.0 Integration Stack
+  Replaces Make.com webhook with native AWS services.
+  Region: eu-west-2 (London)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment
+
+  JobAdderClientId:
+    Type: String
+    NoEcho: true
+    Description: JobAdder OAuth Client ID
+
+  JobAdderClientSecret:
+    Type: String
+    NoEcho: true
+    Description: JobAdder OAuth Client Secret
+
+  TokenRefreshSchedule:
+    Type: String
+    Default: rate(50 minutes)
+    Description: How often to refresh the OAuth token (JobAdder tokens expire after 60 min)
+
+  AlertEmail:
+    Type: String
+    Description: Email address for DLQ/failure alerts
+    Default: alerts@example.com
+
+# ─────────────────────────────────────────────
+# KMS KEY
+# ─────────────────────────────────────────────
+Resources:
+
+  JobAdderKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: JobAdder-OAuth JobAdder — encrypts OAuth tokens and secrets
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: Allow Lambda roles to use key
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt OAuthCallbackLambdaRole.Arn
+                - !GetAtt TokenRefreshLambdaRole.Arn
+                - !GetAtt CandidateFetcherLambdaRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: "*"
+
+  JobAdderKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/jobadder-oauth
+      TargetKeyId: !Ref JobAdderKMSKey
+
+# ─────────────────────────────────────────────
+# SECRETS MANAGER — credential store
+# ─────────────────────────────────────────────
+
+  JobAdderClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub jobadder-oauth/${Environment}/client-credentials
+      Description: JobAdder OAuth client ID and secret
+      KmsKeyId: !Ref JobAdderKMSKey
+      SecretString: !Sub |
+        {
+          "client_id": "${JobAdderClientId}",
+          "client_secret": "${JobAdderClientSecret}"
+        }
+
+  JobAdderTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub jobadder-oauth/${Environment}/tokens
+      Description: JobAdder OAuth access and refresh tokens (auto-updated by Lambda)
+      KmsKeyId: !Ref JobAdderKMSKey
+      SecretString: |
+        {
+          "access_token": "",
+          "refresh_token": "",
+          "token_type": "Bearer",
+          "expires_at": 0,
+          "scope": ""
+        }
+
+# ─────────────────────────────────────────────
+# SQS — job queue + dead-letter queue
+# ─────────────────────────────────────────────
+
+  CandidateJobDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub jobadder-oauth-dlq-${Environment}
+      KmsMasterKeyId: !Ref JobAdderKMSKey
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: JobAdderOAuth
+
+  CandidateJobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub jobadder-oauth-jobs-${Environment}
+      KmsMasterKeyId: !Ref JobAdderKMSKey
+      VisibilityTimeout: 300        # 5 min — must be >= Lambda timeout
+      MessageRetentionPeriod: 86400 # 24 hours
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CandidateJobDLQ.Arn
+        maxReceiveCount: 3          # 3 attempts then → DLQ
+      Tags:
+        - Key: Project
+          Value: JobAdderOAuth
+
+# ─────────────────────────────────────────────
+# SNS — DLQ alert
+# ─────────────────────────────────────────────
+
+  DLQAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub jobadder-oauth-dlq-alerts-${Environment}
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub JobAdderOAuth-DLQ-${Environment}
+      AlarmDescription: Messages landing in JobAdder DLQ — investigate candidate fetch failures
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt CandidateJobDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref DLQAlertTopic
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────
+# IAM ROLES
+# ─────────────────────────────────────────────
+
+  # Shared policy for Secrets Manager + KMS access
+  SecretsKMSPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub JobAdderOAuth-SecretsKMS-${Environment}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DescribeSecret
+            Resource:
+              - !Ref JobAdderClientSecret
+              - !Ref JobAdderTokenSecret
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !GetAtt JobAdderKMSKey.Arn
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+            Resource: "*"
+
+  OAuthCallbackLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub JobAdderOAuth-Callback-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref SecretsKMSPolicy
+
+  TokenRefreshLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub JobAdderOAuth-TokenRefresh-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref SecretsKMSPolicy
+
+  CandidateFetcherLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub JobAdderOAuth-CandidateFetcher-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref SecretsKMSPolicy
+      Policies:
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt CandidateJobQueue.Arn
+                  - !GetAtt CandidateJobDLQ.Arn
+
+# ─────────────────────────────────────────────
+# LAMBDA FUNCTIONS
+# ─────────────────────────────────────────────
+
+  # 1. OAuth Callback — handles the redirect from JobAdder after consent
+  OAuthCallbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub jobadder-oauth-oauth-callback-${Environment}
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt OAuthCallbackLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active  # X-Ray
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          CLIENT_SECRET_ARN: !Ref JobAdderClientSecret
+          TOKEN_SECRET_ARN: !Ref JobAdderTokenSecret
+          JOBADDER_TOKEN_URL: https://id.jobadder.com/connect/token
+          REDIRECT_URI: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/oauth/callback
+      Code:
+        ZipFile: |
+          // Placeholder — deploy via S3 or CDK. See lambda/oauth-callback/index.js
+          exports.handler = async (event) => ({ statusCode: 200, body: 'Deploy lambda code' });
+
+  # 2. Token Refresh — invoked on schedule or 401 detection
+  TokenRefreshFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub jobadder-oauth-token-refresh-${Environment}
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt TokenRefreshLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          CLIENT_SECRET_ARN: !Ref JobAdderClientSecret
+          TOKEN_SECRET_ARN: !Ref JobAdderTokenSecret
+          JOBADDER_TOKEN_URL: https://id.jobadder.com/connect/token
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: 'Deploy lambda code' });
+
+  # 3. Candidate Fetcher — SQS-triggered, calls JobAdder API
+  CandidateFetcherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub jobadder-oauth-candidate-fetcher-${Environment}
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt CandidateFetcherLambdaRole.Arn
+      Timeout: 300  # 5 min max
+      MemorySize: 512
+      TracingConfig:
+        Mode: Active
+      ReservedConcurrentExecutions: 10  # rate limit guard
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          TOKEN_SECRET_ARN: !Ref JobAdderTokenSecret
+          JOBADDER_API_BASE: https://api.jobadder.com/v2
+          TOKEN_REFRESH_FUNCTION: !Sub jobadder-oauth-token-refresh-${Environment}
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: 'Deploy lambda code' });
+
+  # SQS trigger for Candidate Fetcher
+  CandidateFetcherSQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt CandidateJobQueue.Arn
+      FunctionName: !GetAtt CandidateFetcherFunction.Arn
+      BatchSize: 5
+      MaximumBatchingWindowInSeconds: 30
+      FunctionResponseTypes:
+        - ReportBatchItemFailures  # partial batch failure support
+
+# ─────────────────────────────────────────────
+# EVENTBRIDGE — scheduled token refresh
+# ─────────────────────────────────────────────
+
+  TokenRefreshScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub jobadder-oauth-token-refresh-${Environment}
+      Description: Refreshes JobAdder OAuth token every 50 minutes (tokens expire at 60 min)
+      ScheduleExpression: !Ref TokenRefreshSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TokenRefreshFunction.Arn
+          Id: TokenRefreshTarget
+
+  TokenRefreshSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TokenRefreshFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TokenRefreshScheduleRule.Arn
+
+# ─────────────────────────────────────────────
+# API GATEWAY (HTTP API) — OAuth redirect URI
+# ─────────────────────────────────────────────
+
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub jobadder-oauth-api-${Environment}
+      ProtocolType: HTTP
+      Description: JobAdder-OAuth JobAdder integration — OAuth callback + job trigger endpoints
+      CorsConfiguration:
+        AllowOrigins: ['https://your-app.example.com']
+        AllowMethods: [GET, POST]
+        AllowHeaders: [Content-Type, Authorization]
+        MaxAge: 300
+
+  ApiGatewayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  # OAuth callback route: GET /oauth/callback
+  OAuthCallbackIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt OAuthCallbackFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  OAuthCallbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /oauth/callback
+      Target: !Sub integrations/${OAuthCallbackIntegration}
+
+  OAuthCallbackLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OAuthCallbackFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/oauth/callback
+
+  # Trigger candidate fetch: POST /candidates/fetch
+  CandidateFetchIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CandidateFetcherFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  CandidateFetchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: POST /candidates/fetch
+      Target: !Sub integrations/${CandidateFetchIntegration}
+
+  CandidateFetcherLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CandidateFetcherFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/candidates/fetch
+
+# ─────────────────────────────────────────────
+# CLOUDWATCH — log groups with retention
+# ─────────────────────────────────────────────
+
+  OAuthCallbackLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/jobadder-oauth-oauth-callback-${Environment}
+      RetentionInDays: 90
+
+  TokenRefreshLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/jobadder-oauth-token-refresh-${Environment}
+      RetentionInDays: 90
+
+  CandidateFetcherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/jobadder-oauth-candidate-fetcher-${Environment}
+      RetentionInDays: 90
+
+  # Alarm: token refresh Lambda errors
+  TokenRefreshErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub JobAdderOAuth-TokenRefresh-Errors-${Environment}
+      AlarmDescription: OAuth token refresh failing — candidates will 401
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TokenRefreshFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref DLQAlertTopic
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────
+# OUTPUTS
+# ─────────────────────────────────────────────
+
+Outputs:
+
+  OAuthCallbackURL:
+    Description: >
+      NEW Redirect URI — update this in the JobAdder Developer Portal
+      replacing the Make.com webhook URL
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/oauth/callback
+    Export:
+      Name: !Sub JobAdderOAuth-RedirectURI-${Environment}
+
+  CandidateFetchEndpoint:
+    Description: POST endpoint to trigger a candidate fetch job
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/candidates/fetch
+
+  CandidateJobQueueURL:
+    Description: SQS queue URL for candidate fetch jobs
+    Value: !Ref CandidateJobQueue
+
+  CandidateJobDLQURL:
+    Description: Dead-letter queue URL — monitor this for failures
+    Value: !Ref CandidateJobDLQ
+
+  TokenSecretARN:
+    Description: Secrets Manager ARN for OAuth tokens
+    Value: !Ref JobAdderTokenSecret
+
+  KMSKeyARN:
+    Description: KMS key ARN used for encryption
+    Value: !GetAtt JobAdderKMSKey.Arn

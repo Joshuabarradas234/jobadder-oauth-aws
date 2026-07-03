@@ -1,0 +1,10 @@
+{
+  "name": "jobadder-oauth-candidate-fetcher",
+  "version": "1.0.0",
+  "description": "JobAdder OAuth on AWS — candidate-fetcher Lambda",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.500.0",
+    "@aws-sdk/client-lambda": "^3.500.0"
+  }
+}

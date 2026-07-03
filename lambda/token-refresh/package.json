@@ -1,0 +1,9 @@
+{
+  "name": "jobadder-oauth-token-refresh",
+  "version": "1.0.0",
+  "description": "JobAdder OAuth on AWS — token-refresh Lambda",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.500.0"
+  }
+}
